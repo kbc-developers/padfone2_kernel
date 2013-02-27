@@ -19,16 +19,19 @@
 #include <linux/sched.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
+#include <linux/rq_stats.h>
 
 #define INTELLI_PLUG_MAJOR_VERSION	1
-#define INTELLI_PLUG_MINOR_VERSION	1
+#define INTELLI_PLUG_MINOR_VERSION	3
 
 #define DEF_SAMPLING_RATE		(50000)
 #define DEF_SAMPLING_MS			(50)
 
-#define DUAL_CORE_PERSISTENCE		50
-#define TRI_CORE_PERSISTENCE		40
-#define QUAD_CORE_PERSISTENCE		30
+#define DUAL_CORE_PERSISTENCE		60
+#define TRI_CORE_PERSISTENCE		50
+#define QUAD_CORE_PERSISTENCE		40
+
+#define RUN_QUEUE_THRESHOLD		38
 
 static DEFINE_MUTEX(intelli_plug_mutex);
 
@@ -62,6 +65,51 @@ module_param(nr_run_hysteresis, uint, 0644);
 
 static unsigned int nr_run_last;
 
+static unsigned int NwNs_Threshold[] = { 19, 30,  19,  11,  19,  11, 0,  11};
+static unsigned int TwTs_Threshold[] = {140,  0, 140, 190, 140, 190, 0, 190};
+
+static int mp_decision(void)
+{
+	static bool first_call = true;
+	int new_state = 0;
+	int nr_cpu_online;
+	int index;
+	unsigned int rq_depth;
+	static cputime64_t total_time = 0;
+	static cputime64_t last_time;
+	cputime64_t current_time;
+	cputime64_t this_time = 0;
+
+	current_time = ktime_to_ms(ktime_get());
+	if (first_call) {
+		first_call = false;
+	} else {
+		this_time = current_time - last_time;
+	}
+	total_time += this_time;
+
+	rq_depth = rq_info.rq_avg;
+	//pr_info(" rq_deptch = %u", rq_depth);
+	nr_cpu_online = num_online_cpus();
+
+	if (nr_cpu_online) {
+		index = (nr_cpu_online - 1) * 2;
+		if ((nr_cpu_online < 4) && (rq_depth >= NwNs_Threshold[index])) {
+			if (total_time >= TwTs_Threshold[index]) {
+				new_state = 1;
+			}
+		} else {
+			total_time = 0;
+		}
+	} else {
+		total_time = 0;
+	}
+
+	last_time = ktime_to_ms(ktime_get());
+
+	return new_state;
+}
+
 static unsigned int calculate_thread_stats(void)
 {
 	unsigned int avg_nr_run = avg_nr_running();
@@ -70,7 +118,7 @@ static unsigned int calculate_thread_stats(void)
 
 	if (!eco_mode_active) {
 		threshold_size =  ARRAY_SIZE(nr_run_thresholds_full);
-		nr_run_hysteresis = 8;
+		nr_run_hysteresis = 2;
 		nr_fshift = 3;
 		//pr_info("intelliplug: full mode active!");
 	}
@@ -98,16 +146,38 @@ static unsigned int calculate_thread_stats(void)
 	return nr_run;
 }
 
-static void intelli_plug_work_fn(struct work_struct *work)
+static void __cpuinit intelli_plug_work_fn(struct work_struct *work)
 {
 	unsigned int nr_run_stat;
+	unsigned int rq_stat;
+	unsigned int cpu_count = 0;
+	//int decision = 0;
 
 	if (intelli_plug_active == 1) {
 		nr_run_stat = calculate_thread_stats();
 		//pr_info("nr_run_stat: %u\n", nr_run_stat);
+		rq_stat = rq_info.rq_avg;
+
+		cpu_count = nr_run_stat;
+		// detect artificial loads or constant loads
+		// using msm rqstats
+		if (!eco_mode_active && num_online_cpus() >= 2) {
+			if (mp_decision()) {
+				switch (num_online_cpus()) {
+					case 2:
+						cpu_count = 3;
+						pr_info("nr_run(2) => %u\n", nr_run_stat);
+						break;
+					case 3:
+						cpu_count = 4;
+						pr_info("nr_run(3) => %u\n", nr_run_stat);
+						break;
+				}
+			}
+		}
 
 		if (!suspended) {
-			switch (nr_run_stat) {
+			switch (cpu_count) {
 				case 1:
 					if (persist_count > 0)
 						persist_count--;
@@ -173,7 +243,7 @@ static void intelli_plug_early_suspend(struct early_suspend *handler)
 	}
 }
 
-static void intelli_plug_late_resume(struct early_suspend *handler)
+static void __cpuinit intelli_plug_late_resume(struct early_suspend *handler)
 {
 	int num_of_active_cores;
 	int i;
@@ -199,7 +269,7 @@ static void intelli_plug_late_resume(struct early_suspend *handler)
 		msecs_to_jiffies(10));
 }
 
-static struct early_suspend intelli_plug_early_suspend_struct = {
+static struct early_suspend intelli_plug_early_suspend_struct_driver = {
 	.level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 10,
 	.suspend = intelli_plug_early_suspend,
 	.resume = intelli_plug_late_resume,
@@ -223,7 +293,7 @@ int __init intelli_plug_init(void)
 	schedule_delayed_work_on(0, &intelli_plug_work, delay);
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
-	register_early_suspend(&intelli_plug_early_suspend_struct);
+	register_early_suspend(&intelli_plug_early_suspend_struct_driver);
 #endif
 	return 0;
 }
